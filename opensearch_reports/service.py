@@ -30,6 +30,12 @@ class BaseSyncDocument(Document):
     DASHBOARD_NAME - connecting document with dashboard
     """
     DASHBOARD_NAME = None
+    
+    def update(self, *args, **kwargs):
+        res = super().update(*args, **kwargs)
+        if res is None:
+            return (0, [])
+        return res
 
     def is_sync_disabled(self):
         try:
@@ -53,7 +59,8 @@ class BaseSyncDocument(Document):
                 index_opensearch_bulk.delay(
                     app_label, model.__name__, list(actions), using=using, **kwargs
                 )
+            return (0, [])
         else:
             # Log and skip bulk syncing if disabled
             logger.info(f"Skipping bulk sync because sync is disabled for dashboard '{self.DASHBOARD_NAME}'")
-            return None
+            return (0, [])
