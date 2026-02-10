@@ -44,29 +44,26 @@ class BaseSyncDocument(Document):
             # If no dashboard entry, assume sync is enabled
             return False
 
-    def bulk(self, actions, using=None, from_celery=False, **kwargs):
-        if self.is_sync_disabled():
-            logger.info(
-                "Skipping bulk sync because sync is disabled for dashboard '%s'",
-                self.DASHBOARD_NAME,
-            )
-            return (0, [])
+def bulk(self, actions, using=None, from_celery=False, **kwargs):
+    force_sync = os.getenv("OPENSEARCH_FORCE_SYNC") in ("1", "true", "True", "YES", "yes")
 
-        # Force synchronous bulk indexing for backfills / CLI runs
-        force_sync = os.getenv("OPENSEARCH_FORCE_SYNC", "").lower() in ("1", "true", "yes")
-
-        # IMPORTANT: 'actions' is a generator; only convert to list when needed
-        if force_sync or from_celery:
-            return super().bulk(actions, using=using, **kwargs)
-
-        # Async path: send to celery
-        actions_list = list(actions)
-        model = self.Django.model
-        app_label = model._meta.app_label
-
-        index_opensearch_bulk.delay(
-            app_label, model.__name__, actions_list, using=using, **kwargs
+    if self.is_sync_disabled():
+        logger.info(
+            "Skipping bulk sync because sync is disabled for dashboard '%s'",
+            self.DASHBOARD_NAME,
         )
+        return (0, [])
 
-        # Return tuple to satisfy callers (manage.py expects tuple)
-        return (len(actions_list), [])
+    # FORCE SYNC PATH (backfills / rebuilds) OR celery executing the task
+    if force_sync or from_celery:
+        res = super().bulk(actions, using=using, **kwargs)
+        # Normalize return to tuple expected by management command
+        if res is None:
+            return (0, [])
+        return res
+
+    # Normal async behavior (queue to celery)
+    model = self.Django.model
+    app_label = model._meta.app_label
+    index_opensearch_bulk.delay(app_label, model.__name__, list(actions), using=using, **kwargs)
+    return (0, [])
