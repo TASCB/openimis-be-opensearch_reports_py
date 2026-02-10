@@ -1,4 +1,5 @@
 import logging
+import os
 
 from django_opensearch_dsl import Document
 
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class OpenSearchDashboardService(BaseService):
 
-    @register_service_signal('opensearch_dashboard_service.update')
+    @register_service_signal("opensearch_dashboard_service.update")
     def update(self, obj_data):
         return super().update(obj_data)
 
@@ -27,15 +28,13 @@ class BaseSyncDocument(Document):
     """
     Base document class that controls synchronization based on the 'synch_disabled' flag.
     All OpenSearch document classes should inherit from this class.
-    DASHBOARD_NAME - connecting document with dashboard
+
+    Behavior:
+    - If dashboard.synch_disabled=True => do nothing
+    - If OPENSEARCH_FORCE_SYNC=1 OR from_celery=True => run super().bulk() synchronously
+    - Else => queue celery task index_opensearch_bulk.delay(...)
     """
     DASHBOARD_NAME = None
-    
-    def update(self, *args, **kwargs):
-        res = super().update(*args, **kwargs)
-        if res is None:
-            return (0, [])
-        return res
 
     def is_sync_disabled(self):
         try:
@@ -46,21 +45,28 @@ class BaseSyncDocument(Document):
             return False
 
     def bulk(self, actions, using=None, from_celery=False, **kwargs):
-        """
-        Override the bulk method to control batch synchronization dynamically.
-        Document.update() uses bulk()
-        """
-        if not self.is_sync_disabled():
-            if from_celery:
-                return super().bulk(actions, using=using, **kwargs)
-            else:
-                model = self.Django.model
-                app_label = model._meta.app_label
-                index_opensearch_bulk.delay(
-                    app_label, model.__name__, list(actions), using=using, **kwargs
-                )
+        if self.is_sync_disabled():
+            logger.info(
+                "Skipping bulk sync because sync is disabled for dashboard '%s'",
+                self.DASHBOARD_NAME,
+            )
             return (0, [])
-        else:
-            # Log and skip bulk syncing if disabled
-            logger.info(f"Skipping bulk sync because sync is disabled for dashboard '{self.DASHBOARD_NAME}'")
-            return (0, [])
+
+        # Force synchronous bulk indexing for backfills / CLI runs
+        force_sync = os.getenv("OPENSEARCH_FORCE_SYNC", "").lower() in ("1", "true", "yes")
+
+        # IMPORTANT: 'actions' is a generator; only convert to list when needed
+        if force_sync or from_celery:
+            return super().bulk(actions, using=using, **kwargs)
+
+        # Async path: send to celery
+        actions_list = list(actions)
+        model = self.Django.model
+        app_label = model._meta.app_label
+
+        index_opensearch_bulk.delay(
+            app_label, model.__name__, actions_list, using=using, **kwargs
+        )
+
+        # Return tuple to satisfy callers (manage.py expects tuple)
+        return (len(actions_list), [])
